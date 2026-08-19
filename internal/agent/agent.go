@@ -20,6 +20,12 @@ import (
 const (
 	backoffMin = 1 * time.Second
 	backoffMax = 30 * time.Second
+	// Data channels reconnect more aggressively than control channel since a
+	// single data channel failure doesn't affect overall service.
+	dataBackoffMin = 500 * time.Millisecond
+	dataBackoffMax = 10 * time.Second
+	// Handshake timeout protects against stuck connections during hello/welcome.
+	handshakeTimeout = 30 * time.Second
 )
 
 // Agent owns the full lifecycle: one control channel + N data channels.
@@ -30,7 +36,7 @@ type Agent struct {
 	Log  *zap.Logger
 
 	draining      atomic.Bool
-	activeStreams  atomic.Int32
+	activeStreams atomic.Int32
 	dataChanCount atomic.Int32
 	bytesIn       atomic.Int64
 	bytesOut      atomic.Int64
@@ -111,8 +117,10 @@ func (a *Agent) connect(ctx context.Context) error {
 
 // maintainDataChan keeps data channel chID alive for the lifetime of dataCtx,
 // reconnecting with backoff whenever it drops (C6 fix).
+// Data channels use more aggressive backoff (500ms-10s) than control channel
+// (1s-30s) since individual data channel failures don't affect overall service.
 func (a *Agent) maintainDataChan(ctx context.Context, chID int, res ControlResult) {
-	delay := backoffMin
+	delay := dataBackoffMin
 	for {
 		a.dataChanCount.Add(1)
 		runErr := a.runDataChan(ctx, chID, res)
@@ -134,8 +142,8 @@ func (a *Agent) maintainDataChan(ctx context.Context, chID int, res ControlResul
 		case <-time.After(delay):
 		}
 		delay *= 2
-		if delay > backoffMax {
-			delay = backoffMax
+		if delay > dataBackoffMax {
+			delay = dataBackoffMax
 		}
 	}
 }
@@ -161,7 +169,10 @@ func (a *Agent) runDataChan(ctx context.Context, chID int, res ControlResult) er
 }
 
 func (a *Agent) dialDataWS(ctx context.Context, session string, chID int) (*websocket.Conn, error) {
-	conn, _, err := websocket.Dial(ctx, a.URL, &websocket.DialOptions{
+	dialCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(dialCtx, a.URL, &websocket.DialOptions{
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {

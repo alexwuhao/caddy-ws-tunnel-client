@@ -43,7 +43,10 @@ func runControl(
 	log *zap.Logger,
 	cb func(ControlResult),
 ) error {
-	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {
