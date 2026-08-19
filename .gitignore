@@ -36,3 +36,5 @@ go.work.sum
 
 # env file
 .env
+.gitnexus
+.claude/skills/gitnexus

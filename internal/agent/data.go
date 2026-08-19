@@ -110,9 +110,9 @@ type wsNetConn struct {
 	io.ReadWriteCloser
 }
 
-func (w *wsNetConn) LocalAddr() net.Addr               { return dummyAddr{} }
-func (w *wsNetConn) RemoteAddr() net.Addr              { return dummyAddr{} }
-func (w *wsNetConn) SetDeadline(_ time.Time) error     { return nil }
+func (w *wsNetConn) LocalAddr() net.Addr                { return dummyAddr{} }
+func (w *wsNetConn) RemoteAddr() net.Addr               { return dummyAddr{} }
+func (w *wsNetConn) SetDeadline(_ time.Time) error      { return nil }
 func (w *wsNetConn) SetReadDeadline(_ time.Time) error  { return nil }
 func (w *wsNetConn) SetWriteDeadline(_ time.Time) error { return nil }
 

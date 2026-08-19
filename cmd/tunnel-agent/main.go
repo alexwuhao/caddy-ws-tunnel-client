@@ -15,9 +15,9 @@ import (
 
 func main() {
 	var (
-		urlFlag  = flag.String("url", "", "WebSocket URL (wss://host/ws)")
-		keyFlag  = flag.String("key", "", "Auth key")
-		nodeFlag = flag.String("node", "", "Node identifier (derived from key if empty)")
+		urlFlag   = flag.String("url", "", "WebSocket URL (wss://host/ws)")
+		keyFlag   = flag.String("key", "", "Auth key")
+		nodeFlag  = flag.String("node", "", "Node identifier (derived from key if empty)")
 		debugFlag = flag.Bool("debug", false, "Enable debug logging")
 	)
 	flag.Parse()
