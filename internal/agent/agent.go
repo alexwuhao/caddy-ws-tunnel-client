@@ -33,7 +33,11 @@ type Agent struct {
 	URL  string
 	Key  string
 	Node string
-	Log  *zap.Logger
+	// Secret enables HMAC-signed hellos (server node configured with
+	// hmac_secret). When set it is used as the signing key instead of Key, and
+	// Key is not transmitted.
+	Secret string
+	Log    *zap.Logger
 
 	draining      atomic.Bool
 	activeStreams atomic.Int32
@@ -84,7 +88,7 @@ func (a *Agent) connect(ctx context.Context) error {
 
 	err := runControl(
 		ctx,
-		a.URL, a.Key, a.Node,
+		a.URL, a.Key, a.Secret, a.Node,
 		&a.draining,
 		&a.activeStreams,
 		&a.dataChanCount,
@@ -179,13 +183,9 @@ func (a *Agent) dialDataWS(ctx context.Context, session string, chID int) (*webs
 		return nil, fmt.Errorf("dial data ws: %w", err)
 	}
 
-	hello := proto.Hello{
-		Role:      proto.RoleData,
-		Node:      a.Node,
-		Key:       a.Key,
-		Session:   session,
-		ChannelID: chID,
-	}
+	// Data hellos must also carry a fresh ts/nonce/sig when the server node uses
+	// hmac_secret; plaintext servers simply ignore the extra fields.
+	hello := newSignedHello(a.Key, a.Secret, a.Node, proto.RoleData, session, chID)
 	b, err := proto.WrapEnvelope(proto.TypeHello, hello)
 	if err != nil {
 		conn.CloseNow()

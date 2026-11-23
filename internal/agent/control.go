@@ -34,7 +34,7 @@ type ControlResult struct {
 // can spawn data channels before the loop starts.
 func runControl(
 	ctx context.Context,
-	wsURL, key, node string,
+	wsURL, key, secret, node string,
 	draining *atomic.Bool,
 	activeStreams *atomic.Int32,
 	dataChanCount *atomic.Int32,
@@ -54,17 +54,9 @@ func runControl(
 	}
 	defer conn.CloseNow()
 
-	// Send hello.
-	ts := nowUnix()
-	nonce := newNonce()
-	hello := proto.Hello{
-		Role:  proto.RoleControl,
-		Node:  node,
-		Key:   key,
-		Ts:    ts,
-		Nonce: nonce,
-		Sig:   signHello(key, node, nonce, ts),
-	}
+	// Send hello. A fresh ts/nonce is minted per handshake, and in HMAC mode the
+	// secret is never placed on the wire (hello.Key stays empty).
+	hello := newSignedHello(key, secret, node, proto.RoleControl, "", 0)
 	if err := sendMsg(ctx, conn, proto.TypeHello, hello); err != nil {
 		return fmt.Errorf("send hello: %w", err)
 	}
@@ -114,87 +106,100 @@ func runControl(
 	pingTicker := time.NewTicker(heartbeat)
 	defer pingTicker.Stop()
 
-	for {
-		// Use a read deadline of heartbeat/2 to service tickers without a separate goroutine.
-		msgCtx, cancel := context.WithTimeout(ctx, heartbeat/2)
-		typ, raw, readErr := recvMsg(msgCtx, conn)
-		cancel()
-
-		if readErr != nil {
-			// Parent cancelled → graceful shutdown.
-			if ctx.Err() != nil {
-				_ = sendMsg(ctx, conn, proto.TypeBye, proto.Bye{Reason: "shutdown"})
-				return nil
+	// coder/websocket closes the connection when the context passed to Read is
+	// cancelled. Scoping a read to a short timeout (as this loop used to) therefore
+	// tore the control channel down on every heartbeat tick — and with it every
+	// data channel. Instead, one goroutine owns reads and the select below
+	// multiplexes reader output, tickers and shutdown.
+	type readResult struct {
+		typ string
+		raw json.RawMessage
+		err error
+	}
+	readCh := make(chan readResult, 1)
+	go func() {
+		for {
+			typ, raw, err := recvMsg(ctx, conn)
+			select {
+			case readCh <- readResult{typ: typ, raw: raw, err: err}:
+			case <-ctx.Done():
+				return
 			}
-			// Read deadline expired (expected heartbeat tick) → service tickers and continue.
-			if errors.Is(readErr, context.DeadlineExceeded) {
-				select {
-				case <-statsTicker.C:
-					_ = sendStats(ctx, conn, dataChanCount, activeStreams, bytesIn, bytesOut, dialErrors)
-				default:
-				}
-				select {
-				case <-pingTicker.C:
-					_ = sendMsg(ctx, conn, proto.TypePing, proto.Ping{Nonce: newNonce(), Ts: nowUnix()})
-				default:
-				}
-				continue
+			if err != nil {
+				return
 			}
-			// Any other error (TCP RST, websocket close, etc.) is a real connection failure.
-			return fmt.Errorf("control read: %w", readErr)
 		}
+	}()
 
-		switch typ {
-		case proto.TypePing:
-			var p proto.Ping
-			_ = json.Unmarshal(raw, &p)
-			_ = sendMsg(ctx, conn, proto.TypePong, proto.Pong{Nonce: p.Nonce, Ts: nowUnix()})
+	sendPing := func() {
+		_ = sendMsg(ctx, conn, proto.TypePing, proto.Ping{Nonce: newNonce(), Ts: nowUnix()})
+	}
+	sendTelemetry := func() {
+		_ = sendStats(ctx, conn, dataChanCount, activeStreams, bytesIn, bytesOut, dialErrors)
+	}
 
-		case proto.TypePong:
-			// RTT measurement: no-op for now.
-
-		case proto.TypeReloadConfig:
-			var cfg proto.Config
-			if err := json.Unmarshal(raw, &cfg); err != nil {
-				log.Warn("reload_config parse error", zap.Error(err))
-				continue
-			}
-			al.Replace(cfg.Ports)
-			if d, err := time.ParseDuration(cfg.DialTimeout); err == nil && d > 0 {
-				dialTimeoutNs.Store(int64(d))
-			}
-			log.Info("config reloaded", zap.Int("ports", len(cfg.Ports)))
-
-		case proto.TypeDrain:
-			draining.Store(true)
-			log.Info("drain received, no longer accepting new streams")
-
-		case proto.TypeBye:
-			log.Info("server sent bye, closing")
+	for {
+		select {
+		case <-ctx.Done():
+			byeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			_ = sendMsg(byeCtx, conn, proto.TypeBye, proto.Bye{Reason: "shutdown"})
+			cancel()
 			return nil
 
-		case proto.TypeError:
-			var e proto.Error
-			_ = json.Unmarshal(raw, &e)
-			log.Error("server error", zap.String("code", e.Code), zap.String("msg", e.Msg))
-			if isAuthError(e.Code) {
-				return fmt.Errorf("%w: %s %s", ErrAuth, e.Code, e.Msg)
+		case <-pingTicker.C:
+			sendPing()
+
+		case <-statsTicker.C:
+			sendTelemetry()
+
+		case r := <-readCh:
+			if r.err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("control read: %w", r.err)
 			}
 
-		default:
-			// ignore unknown types for forward compatibility
-		}
+			switch r.typ {
+			case proto.TypePing:
+				var p proto.Ping
+				_ = json.Unmarshal(r.raw, &p)
+				_ = sendMsg(ctx, conn, proto.TypePong, proto.Pong{Nonce: p.Nonce, Ts: nowUnix()})
 
-		// Service tickers non-blocking after a successful message read.
-		select {
-		case <-statsTicker.C:
-			_ = sendStats(ctx, conn, dataChanCount, activeStreams, bytesIn, bytesOut, dialErrors)
-		default:
-		}
-		select {
-		case <-pingTicker.C:
-			_ = sendMsg(ctx, conn, proto.TypePing, proto.Ping{Nonce: newNonce(), Ts: nowUnix()})
-		default:
+			case proto.TypePong:
+				// RTT measurement: no-op for now.
+
+			case proto.TypeReloadConfig:
+				var cfg proto.Config
+				if err := json.Unmarshal(r.raw, &cfg); err != nil {
+					log.Warn("reload_config parse error", zap.Error(err))
+					continue
+				}
+				al.Replace(cfg.Ports)
+				if d, err := time.ParseDuration(cfg.DialTimeout); err == nil && d > 0 {
+					dialTimeoutNs.Store(int64(d))
+				}
+				log.Info("config reloaded", zap.Int("ports", len(cfg.Ports)))
+
+			case proto.TypeDrain:
+				draining.Store(true)
+				log.Info("drain received, no longer accepting new streams")
+
+			case proto.TypeBye:
+				log.Info("server sent bye, closing")
+				return nil
+
+			case proto.TypeError:
+				var e proto.Error
+				_ = json.Unmarshal(r.raw, &e)
+				log.Error("server error", zap.String("code", e.Code), zap.String("msg", e.Msg))
+				if isAuthError(e.Code) {
+					return fmt.Errorf("%w: %s %s", ErrAuth, e.Code, e.Msg)
+				}
+
+			default:
+				// ignore unknown types for forward compatibility
+			}
 		}
 	}
 }
