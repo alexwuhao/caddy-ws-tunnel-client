@@ -184,6 +184,10 @@ Register-ScheduledTask -TaskName "tunnel-agent" -Action $action `
   -Trigger (New-ScheduledTaskTrigger -AtStartup) -RunLevel Highest -User "SYSTEM"
 ```
 
+> **更稳的生产写法**：让计划任务运行一个 **supervisor 循环脚本**（`while ($true) { Start-Process ... -PassThru; $proc.WaitForExit(); Start-Sleep 5 }`），agent 崩溃/被杀后 5 秒自动拉起，再叠加计划任务的"失败重启"兜底。secret 放在受 ACL 保护的单独文件（仅 SYSTEM/Administrators 可读），不要写进任务参数或脚本里。
+>
+> 另外建议：任务用 `-MultipleInstances IgnoreNew` 防止重复实例；日志按大小轮转；升级客户端时只覆盖 exe 再 `Stop-ScheduledTask` / `Start-ScheduledTask`。
+
 ## 5. 参数速查
 
 | 参数 | 环境变量 | 说明 |
