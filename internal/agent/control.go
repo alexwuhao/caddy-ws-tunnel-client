@@ -164,7 +164,7 @@ func runControl(
 			case proto.TypePing:
 				var p proto.Ping
 				_ = json.Unmarshal(r.raw, &p)
-				_ = sendMsg(ctx, conn, proto.TypePong, proto.Pong{Nonce: p.Nonce, Ts: nowUnix()})
+				_ = sendMsg(ctx, conn, proto.TypePong, proto.Pong{Nonce: p.Nonce, Ts: pongTimestamp(p)})
 
 			case proto.TypePong:
 				// RTT measurement: no-op for now.
@@ -254,6 +254,16 @@ func recvMsg(ctx context.Context, conn *websocket.Conn) (typ string, payload jso
 		return "", nil, err
 	}
 	return env.Type, env.Payload, nil
+}
+
+// pongTimestamp returns the Ts to echo in a Pong. The server sends its ping Ts
+// in UnixNano and measures RTT as now - pong.Ts, so the value must be echoed
+// verbatim; only fall back to the local clock when the server omitted Ts.
+func pongTimestamp(p proto.Ping) int64 {
+	if p.Ts != 0 {
+		return p.Ts
+	}
+	return nowUnix()
 }
 
 func isAuthError(code string) bool {
